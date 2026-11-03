@@ -45,6 +45,28 @@ In the `--cancel-ok` case, a `basic.get` from another connection at 2.5 s return
 
 With `--queue-type classic`, neither mode cancelled the consumer within 90 s, so this reproduces on quorum queues only.
 
+## Late acknowledgements
+
+`late_ack.py` holds one delivery past its timeout and then acknowledges it, to show that a late acknowledgement is not what closes the channel:
+
+```bash
+.venv/bin/python late_ack.py --cancel-ok --ack-at 4
+.venv/bin/python late_ack.py --ack-at 4
+.venv/bin/python late_ack.py --ack-at 15
+.venv/bin/python late_ack.py --cancel-ok --ack-at 4 --nack
+.venv/bin/python late_ack.py --cancel-ok --ack-at 4 --bogus-tag
+```
+
+| Command | Channel | Queue afterwards |
+| -- | -- | -- |
+| `--cancel-ok --ack-at 4` | open | the message is back |
+| `--ack-at 4`, inside the 10 s window | open | the message is back |
+| `--ack-at 15`, after the window | open | the message is back |
+| `--cancel-ok --ack-at 4 --nack` | open | the message is back |
+| `--bogus-tag`, tag 999 never issued | closed, 406 `unknown delivery tag 999` | the message is back |
+
+The channel ignores a late acknowledgement for a delivery it reclaimed for a timed-out consumer, but still closes for a tag it never issued. So it knows the consumer was cancelled for a timeout when an acknowledgement arrives, and not when one of the consumer's remaining deliveries times out.
+
 ## Why
 
 From `deps/rabbit/src/rabbit_channel.erl` on `v4.4.x` at 9bedff5500 (the same file on `main` at 2e3666cd65):
