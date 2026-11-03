@@ -1,14 +1,14 @@
 """
-Reproduce a channel closed with 406 after the client confirms a consumer-timeout cancellation.
+Reproduce a channel closed with 406 when a cancelled consumer's later delivery times out.
 
 One consumer holds two unacknowledged deliveries whose acknowledgement timeouts expire at
 different moments. RabbitMQ (4.3+, `consumer_timeout_response = notify_consumer`, the default)
-cancels the consumer with `basic.cancel` when the first one expires. The only variable is whether
-this client answers that `basic.cancel` with `basic.cancel-ok`:
+cancels the consumer with `basic.cancel` when the first one expires, and closes the channel with
+406 PRECONDITION_FAILED when the second expires after the consumer has been removed:
 
-- `--no-cancel-ok`: the broker keeps the consumer cancel-pending for 10 s; the channel stays open.
-- `--cancel-ok`: the broker removes the consumer at once; when the second delivery expires the
-  broker closes the channel with 406 PRECONDITION_FAILED.
+- `--cancel-ok` answers `basic.cancel` with `basic.cancel-ok`, so the consumer is removed at once.
+- `--no-cancel-ok` does not answer, so the consumer stays cancel-pending for 10 s, and only an
+  expiry after that window closes the channel.
 
 pika 1.4.4 never sends `basic.cancel-ok` itself, so with `--cancel-ok` this script sends it.
 """

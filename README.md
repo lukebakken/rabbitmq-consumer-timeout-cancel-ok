@@ -1,11 +1,11 @@
-# A confirmed consumer-timeout cancellation closes the channel
+# A cancelled consumer's later delivery timeout closes the channel
 
 > [!NOTE]
 > Written by Claude Code under the direction of @lukebakken.
 
-On RabbitMQ 4.3 and later, a consumer whose delivery exceeds the consumer timeout is cancelled with `basic.cancel` instead of having its channel closed (`consumer_timeout_response = notify_consumer`, the default). If the client answers that `basic.cancel` with `basic.cancel-ok`, as the broker's `accept_consumer_cancel_ok` capability invites, and the consumer holds a second unacknowledged delivery that expires later, **the broker closes the channel with 406 `PRECONDITION_FAILED`**. A client that does not answer keeps its channel.
+On RabbitMQ 4.3 and later, a consumer whose delivery exceeds the consumer timeout is cancelled with `basic.cancel` instead of having its channel closed (`consumer_timeout_response = notify_consumer`, the default). The cancellation returns only the deliveries that have already timed out. **Any delivery the consumer still holds stays on the channel, and when it times out the broker closes the channel with 406 `PRECONDITION_FAILED`**, which is what `notify_consumer` exists to avoid.
 
-The Java, .NET and Go clients send `basic.cancel-ok` when the broker advertises the capability, and pika does from 1.5.0. So the clients that follow the new protocol are the ones whose channels close.
+Whether a client sees this depends on when its other deliveries expire. Until the broker removes the consumer, a timeout for it is ignored. A client that answers `basic.cancel` with `basic.cancel-ok`, as the `accept_consumer_cancel_ok` capability invites, has the consumer removed at once, so any later expiry closes the channel. A client that does not answer keeps the consumer cancel-pending for 10 s, which hides expiries inside that window but not later ones. The Java, .NET and Go clients send `basic.cancel-ok`, and pika does from 1.5.0.
 
 ## Reproduce
 
@@ -14,23 +14,22 @@ Requires Docker and Python 3.8 or later.
 ```bash
 docker run -d --name rabbitmq-repro -p 127.0.0.1:5672:5672 -p 127.0.0.1:15672:15672 rabbitmq:4.4-management
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python repro.py --no-cancel-ok
 .venv/bin/python repro.py --cancel-ok
+.venv/bin/python repro.py --no-cancel-ok
+.venv/bin/python repro.py --no-cancel-ok --timeout-ms 20000 --gap 15 --watch 60
 ```
 
 Wait for the broker to start before the first run (`docker logs rabbitmq-repro` shows "Server startup complete").
 
-`--no-cancel-ok`:
+The script sets a `consumer-timeout` policy on its own quorum queue, consumes with prefetch 10, and holds two deliveries `--gap` seconds apart, so they time out at different moments. The second must arrive before the first times out (`--gap` below `--timeout-ms`), or the consumer is already cancelled and it is never delivered. It uses pika 1.4.4, which never sends `basic.cancel-ok` itself, and sends the frame explicitly for `--cancel-ok`. `repro.py --help` lists the options.
 
-```
-run 1: channel still open after 30.0 s
-      0.0s  delivery 1 received; never acknowledged
-      1.0s  second message published
-      1.0s  delivery 2 received; never acknowledged
-      2.0s  basic.cancel received from broker
-```
+| Command | Second delivery times out | Result against RabbitMQ 4.4.0 |
+| -- | -- | -- |
+| `--cancel-ok` | 1 s after the consumer is removed | channel closed with 406 at 3 s, 10 of 10 runs |
+| `--no-cancel-ok` | inside the 10 s cancel-pending window | channel stays open, 10 of 10 runs |
+| `--no-cancel-ok --timeout-ms 20000 --gap 15` | 5 s after the window ends | channel closed with 406 at 35 s, 2 of 2 runs |
 
-`--cancel-ok`:
+`--cancel-ok` output:
 
 ```
 run 1: CHANNEL CLOSED 406
@@ -42,11 +41,9 @@ run 1: CHANNEL CLOSED 406
       3.0s  channel closed by broker: 406 PRECONDITION_FAILED - delivery acknowledgement on channel 1 timed out. This timeout value can be configured, see consumers doc guide to learn more
 ```
 
-Against RabbitMQ 4.4.0 with a quorum queue, `--runs 10` gives 10 of 10 channels closed with `--cancel-ok` and 0 of 10 with `--no-cancel-ok`.
+In the `--cancel-ok` case, a `basic.get` from another connection at 2.5 s returns only the first message: the cancellation returned the delivery that had timed out, and the consumer's channel still held the second when it timed out at 3 s. In the second case, both messages were back in the queue, with no consumer, at the first check after the window, 35 s in.
 
-The script sets a 2 s `consumer-timeout` policy on its own queue, consumes with prefetch 10, and holds two deliveries 1 s apart. The second must arrive before the first expires (`--gap` below `--timeout-ms`), or the consumer is already cancelled and it is never delivered. It uses pika 1.4.4, which never sends `basic.cancel-ok` itself, and sends the frame explicitly for `--cancel-ok`, so that frame is the only difference between the two runs. `repro.py --help` lists the options.
-
-With `--queue-type classic` neither mode cancelled the consumer within 90 s, so this reproduces on quorum queues only.
+With `--queue-type classic`, neither mode cancelled the consumer within 90 s, so this reproduces on quorum queues only.
 
 ## Why
 
@@ -56,8 +53,8 @@ From `deps/rabbit/src/rabbit_channel.erl` on `v4.4.x` at 9bedff5500 (the same fi
 2. Sending `basic.cancel` ([`notify_consumer_of_cancelation_after_delivery_timeout`](https://github.com/rabbitmq/rabbitmq-server/blob/9bedff5500/deps/rabbit/src/rabbit_channel.erl#L2942)) marks the consumer cancel-pending and starts a timer of [`CONSUMER_CANCEL_OK_TIMEOUT`](https://github.com/rabbitmq/rabbitmq-server/blob/9bedff5500/deps/rabbit/src/rabbit_channel.erl#L192), 10 s. A later timeout for a consumer that is cancel-pending is ignored.
 3. [`basic.cancel-ok`](https://github.com/rabbitmq/rabbitmq-server/blob/9bedff5500/deps/rabbit/src/rabbit_channel.erl#L1559) for a cancel-pending consumer cancels it immediately, which removes it from the consumer map. Without one, the [timer](https://github.com/rabbitmq/rabbitmq-server/blob/9bedff5500/deps/rabbit/src/rabbit_channel.erl#L738) does the same after 10 s.
 
-So the second delivery's timeout, at 3 s, finds the consumer still cancel-pending when the client stays silent, and is ignored. When the client has sent `basic.cancel-ok`, the consumer is already gone, and the fallback closes the channel. `notify_consumer` exists to avoid exactly this channel closure, and here it is lost by the client that cooperates with it.
+Once the consumer is out of the map, the next timeout of a delivery it still holds takes the fallback in step 1.
 
 ## The question
 
-Should an unacknowledged delivery that belonged to a consumer already cancelled for a consumer timeout close the channel, or be handled as part of that cancellation?
+Should a delivery from a consumer already cancelled for a timeout be covered by that cancellation instead of closing the channel?
